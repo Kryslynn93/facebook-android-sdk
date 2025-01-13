@@ -8,36 +8,113 @@
 
 package com.facebook.appevents.iap
 
+import com.facebook.appevents.iap.InAppPurchaseUtils.BillingClientVersion.V2_V4
+import com.facebook.appevents.iap.InAppPurchaseUtils.BillingClientVersion.V5_V7
+import com.facebook.appevents.iap.InAppPurchaseUtils.IAPProductType.INAPP
 import android.content.Context
 import androidx.annotation.RestrictTo
+import com.facebook.appevents.iap.InAppPurchaseLoggerManager.getIsFirstAppLaunchWithNewIAP
+import com.facebook.appevents.iap.InAppPurchaseLoggerManager.migrateOldCacheHistory
+import com.facebook.appevents.iap.InAppPurchaseLoggerManager.setAppHasBeenLaunchedWithNewIAP
+import com.facebook.appevents.iap.InAppPurchaseUtils.IAPProductType.SUBS
+import com.facebook.appevents.integrity.ProtectedModeManager
+import com.facebook.internal.FeatureManager
+import com.facebook.internal.FeatureManager.isEnabled
 import com.facebook.internal.instrument.crashshield.AutoHandleExceptions
+import java.util.concurrent.atomic.AtomicBoolean
 
 @AutoHandleExceptions
 @RestrictTo(RestrictTo.Scope.LIBRARY_GROUP)
 object InAppPurchaseAutoLogger {
-  private const val BILLING_CLIENT_PURCHASE_NAME = "com.android.billingclient.api.Purchase"
+    val failedToCreateWrapper = AtomicBoolean(false)
 
-  @JvmStatic
-  fun startIapLogging(context: Context) {
-    // check if the app has IAP with Billing Lib
-    if (InAppPurchaseUtils.getClass(BILLING_CLIENT_PURCHASE_NAME) == null) {
-      return
-    }
-    val billingClientWrapper =
-        InAppPurchaseBillingClientWrapper.getOrCreateInstance(context) ?: return
-    if (InAppPurchaseBillingClientWrapper.isServiceConnected.get()) {
-      if (InAppPurchaseLoggerManager.eligibleQueryPurchaseHistory()) {
-        billingClientWrapper.queryPurchaseHistory("inapp") { logPurchase() }
-      } else {
-        billingClientWrapper.queryPurchase("inapp") { logPurchase() }
-      }
-    }
-  }
+    @Synchronized
+    @JvmStatic
+    fun startIapLogging(
+        context: Context,
+        billingClientVersion: InAppPurchaseUtils.BillingClientVersion
+    ) {
+        // Check if we have previously tried and failed to create a billing client wrapper
+        if (failedToCreateWrapper.get()) {
+            return
+        }
+        var billingClientWrapper: InAppPurchaseBillingClientWrapper? = null
+        if (billingClientVersion == V2_V4) {
+            billingClientWrapper =
+                InAppPurchaseBillingClientWrapperV2V4.getOrCreateInstance(context)
+        } else if (billingClientVersion == V5_V7) {
+            billingClientWrapper =
+                InAppPurchaseBillingClientWrapperV5V7.getOrCreateInstance(context)
+        }
+        if (billingClientWrapper == null) {
+            failedToCreateWrapper.set(true)
+            return
+        }
 
-  private fun logPurchase() {
-    InAppPurchaseLoggerManager.filterPurchaseLogging(
-        InAppPurchaseBillingClientWrapper.purchaseDetailsMap,
-        InAppPurchaseBillingClientWrapper.skuDetailsMap)
-    InAppPurchaseBillingClientWrapper.purchaseDetailsMap.clear()
-  }
+        if (isEnabled(FeatureManager.Feature.AndroidIAPSubscriptionAutoLogging)
+            && (!ProtectedModeManager.isEnabled() || billingClientVersion == V2_V4)
+        ) {
+            billingClientWrapper.queryPurchaseHistory(INAPP) {
+                billingClientWrapper.queryPurchaseHistory(SUBS) {
+                    logPurchase(billingClientVersion, context.packageName)
+                }
+            }
+        } else {
+            billingClientWrapper.queryPurchaseHistory(INAPP) {
+                logPurchase(billingClientVersion, context.packageName)
+            }
+        }
+    }
+
+    private fun logPurchase(
+        billingClientVersion: InAppPurchaseUtils.BillingClientVersion,
+        packageName: String
+    ) {
+        val isFirstAppLaunch = getIsFirstAppLaunchWithNewIAP()
+        if (isFirstAppLaunch) {
+            migrateOldCacheHistory()
+        }
+        if (billingClientVersion == V2_V4) {
+            InAppPurchaseLoggerManager.filterPurchaseLogging(
+                InAppPurchaseBillingClientWrapperV2V4.iapPurchaseDetailsMap,
+                InAppPurchaseBillingClientWrapperV2V4.skuDetailsMap,
+                false,
+                packageName,
+                billingClientVersion,
+                isFirstAppLaunch
+            )
+            InAppPurchaseLoggerManager.filterPurchaseLogging(
+                InAppPurchaseBillingClientWrapperV2V4.subsPurchaseDetailsMap,
+                InAppPurchaseBillingClientWrapperV2V4.skuDetailsMap,
+                true,
+                packageName,
+                billingClientVersion,
+                isFirstAppLaunch,
+            )
+            InAppPurchaseBillingClientWrapperV2V4.iapPurchaseDetailsMap.clear()
+            InAppPurchaseBillingClientWrapperV2V4.subsPurchaseDetailsMap.clear()
+        } else {
+            InAppPurchaseLoggerManager.filterPurchaseLogging(
+                InAppPurchaseBillingClientWrapperV5V7.iapPurchaseDetailsMap,
+                InAppPurchaseBillingClientWrapperV5V7.productDetailsMap,
+                false,
+                packageName,
+                billingClientVersion,
+                isFirstAppLaunch,
+            )
+            InAppPurchaseLoggerManager.filterPurchaseLogging(
+                InAppPurchaseBillingClientWrapperV5V7.subsPurchaseDetailsMap,
+                InAppPurchaseBillingClientWrapperV5V7.productDetailsMap,
+                true,
+                packageName,
+                billingClientVersion,
+                isFirstAppLaunch,
+            )
+            InAppPurchaseBillingClientWrapperV5V7.iapPurchaseDetailsMap.clear()
+            InAppPurchaseBillingClientWrapperV5V7.subsPurchaseDetailsMap.clear()
+        }
+        if (isFirstAppLaunch) {
+            setAppHasBeenLaunchedWithNewIAP()
+        }
+    }
 }

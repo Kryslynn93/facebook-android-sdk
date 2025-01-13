@@ -9,161 +9,282 @@
 package com.facebook.appevents.iap
 
 import android.content.Context
-import android.content.SharedPreferences
 import androidx.annotation.RestrictTo
 import androidx.annotation.VisibleForTesting
 import com.facebook.FacebookSdk.getApplicationContext
 import com.facebook.appevents.internal.AutomaticAnalyticsLogger.logPurchase
+import com.facebook.appevents.internal.Constants
 import com.facebook.internal.instrument.crashshield.AutoHandleExceptions
-import java.lang.Exception
 import java.util.HashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArraySet
 import org.json.JSONObject
+import kotlin.Exception
+import kotlin.math.abs
+import kotlin.math.log10
+import kotlin.math.max
+import kotlin.math.min
 
 @AutoHandleExceptions
 @RestrictTo(RestrictTo.Scope.LIBRARY_GROUP)
 object InAppPurchaseLoggerManager {
-  private lateinit var sharedPreferences: SharedPreferences
-  private val cachedPurchaseSet: MutableSet<String> = CopyOnWriteArraySet()
-  private val cachedPurchaseMap: MutableMap<String, Long> = ConcurrentHashMap()
-  private const val PURCHASE_TIME = "purchaseTime"
-  private const val PRODUCT_DETAILS_STORE = "com.facebook.internal.iap.PRODUCT_DETAILS"
-  private const val LAST_CLEARED_TIME = "LAST_CLEARED_TIME"
-  private const val PURCHASE_DETAILS_SET = "PURCHASE_DETAILS_SET"
-  private const val LAST_QUERY_PURCHASE_HISTORY_TIME = "LAST_QUERY_PURCHASE_HISTORY_TIME"
-  private const val CACHE_CLEAR_TIME_LIMIT_SEC = 7 * 24 * 60 * 60 // 7 days
-  private const val PURCHASE_IN_CACHE_INTERVAL = 24 * 60 * 60 // 1 day
-  private fun readPurchaseCache() {
-    // clear cached purchases logged by lib 1
-    val cachedSkuSharedPref =
-        getApplicationContext()
-            .getSharedPreferences("com.facebook.internal.SKU_DETAILS", Context.MODE_PRIVATE)
-    val cachedPurchaseSharedPref =
-        getApplicationContext()
-            .getSharedPreferences("com.facebook.internal.PURCHASE", Context.MODE_PRIVATE)
-    if (cachedSkuSharedPref.contains("LAST_CLEARED_TIME")) {
-      cachedSkuSharedPref.edit().clear().apply()
-      cachedPurchaseSharedPref.edit().clear().apply()
-    }
-    sharedPreferences =
-        getApplicationContext().getSharedPreferences(PRODUCT_DETAILS_STORE, Context.MODE_PRIVATE)
-    cachedPurchaseSet.addAll(
-        sharedPreferences.getStringSet(PURCHASE_DETAILS_SET, hashSetOf()) ?: hashSetOf())
+    // January 10, 2025 05:00:00 PM GMT
+    private const val APPROXIMATE_IAP_ENHANCEMENT_RELEASE_TIME = 1736528400000L
+    private const val MILLISECONDS_IN_SECONDS = 1000.0
+    private const val PURCHASE_TIME = "purchaseTime"
+    private const val IAP_SKU_CACHE_GPBLV1 = "com.facebook.internal.SKU_DETAILS"
+    private const val IAP_PURCHASE_CACHE_GPBLV1 = "com.facebook.internal.PURCHASE"
+    private const val IAP_CACHE_OLD = "com.facebook.internal.iap.PRODUCT_DETAILS"
 
-    // Construct purchase de-dup map.
-    for (purchaseHistory in cachedPurchaseSet) {
-      val splitPurchase = purchaseHistory.split(";", limit = 2)
-      cachedPurchaseMap[splitPurchase[0]] = splitPurchase[1].toLong()
-    }
+    private const val IAP_CACHE_GPBLV2V7 = "com.facebook.internal.iap.IAP_CACHE_GPBLV2V7"
+    private const val CACHED_PURCHASES_KEY = "PURCHASE_DETAILS_SET"
+    private const val APP_HAS_BEEN_LAUNCHED_KEY = "APP_HAS_BEEN_LAUNCHED_KEY"
+    private const val TIME_OF_LAST_LOGGED_PURCHASE_KEY = "TIME_OF_LAST_LOGGED_PURCHASE"
+    private const val TIME_OF_LAST_LOGGED_SUBSCRIPTION_KEY = "TIME_OF_LAST_LOGGED_SUBSCRIPTION"
 
-    // Clean up cache every 7 days, and only keep recent 1 day purchases
-    clearOutdatedProductInfoInCache()
-  }
+    @JvmStatic
+    fun migrateOldCacheHistory() {
+        val iapCache =
+            getApplicationContext().getSharedPreferences(
+                IAP_CACHE_GPBLV2V7,
+                Context.MODE_PRIVATE
+            )
+        var newestCandidateTime = max(
+            max(
+                iapCache.getLong(
+                    TIME_OF_LAST_LOGGED_PURCHASE_KEY,
+                    0L
+                ),
+                iapCache.getLong(
+                    TIME_OF_LAST_LOGGED_SUBSCRIPTION_KEY,
+                    0L
+                )
+            ), APPROXIMATE_IAP_ENHANCEMENT_RELEASE_TIME
+        )
+        val cachedPurchaseSet: MutableSet<String> = CopyOnWriteArraySet()
+        val sharedPreferences =
+            getApplicationContext().getSharedPreferences(
+                IAP_CACHE_OLD,
+                Context.MODE_PRIVATE
+            )
+        if (sharedPreferences.contains(CACHED_PURCHASES_KEY)) {
+            cachedPurchaseSet.addAll(
+                sharedPreferences.getStringSet(CACHED_PURCHASES_KEY, hashSetOf()) ?: hashSetOf()
+            )
 
-  @JvmStatic
-  fun filterPurchaseLogging(
-      purchaseDetailsMap: MutableMap<String, JSONObject>,
-      skuDetailsMap: Map<String, JSONObject?>
-  ) {
-    readPurchaseCache()
-    val loggingReadyMap: Map<String, String> =
-        constructLoggingReadyMap(cacheDeDupPurchase(purchaseDetailsMap), skuDetailsMap)
-    logPurchases(loggingReadyMap)
-  }
+            // Construct purchase de-dup map.
+            for (purchaseHistory in cachedPurchaseSet) {
+                try {
+                    val splitPurchase = purchaseHistory.split(";", limit = 2)
+                    val timeInMilliseconds = splitPurchase[1].toLong() * 1000L
 
-  private fun logPurchases(purchaseDetailsMap: Map<String, String>) {
-    for ((purchaseDetails, skuDetails) in purchaseDetailsMap) {
-      if (purchaseDetails != null && skuDetails != null) {
-        logPurchase(purchaseDetails, skuDetails, false)
-      }
-    }
-  }
+                    // Don't migrate any invalid values in cache
+                    val digitsInTime = timeInMilliseconds.toString().length
+                    val digitsInReleaseTime =
+                        APPROXIMATE_IAP_ENHANCEMENT_RELEASE_TIME.toString().length
+                    if (abs(digitsInTime - digitsInReleaseTime) >= log10(
+                            MILLISECONDS_IN_SECONDS
+                        )
+                    ) {
+                        continue
+                    }
+                    newestCandidateTime = max(newestCandidateTime, timeInMilliseconds)
 
-  @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
-  internal fun cacheDeDupPurchase(
-      purchaseDetailsMap: MutableMap<String, JSONObject>
-  ): Map<String, JSONObject> {
-    val nowSec = System.currentTimeMillis() / 1000L
-    val tempPurchaseDetailsMap: Map<String, JSONObject> = purchaseDetailsMap.toMap()
-    for ((key, purchaseJson) in tempPurchaseDetailsMap) {
-      try {
-        if (purchaseJson.has("purchaseToken")) {
-          val purchaseToken = purchaseJson.getString("purchaseToken")
-          if (cachedPurchaseMap.containsKey(purchaseToken)) {
-            purchaseDetailsMap.remove(key)
-          } else {
-            cachedPurchaseSet.add("$purchaseToken;$nowSec")
-          }
+                } catch (e: Exception) {
+                    /* Swallow */
+                    continue
+                }
+            }
         }
-      } catch (e: Exception) {
-        /* swallow */
-      }
+        iapCache.edit()
+            .putLong(TIME_OF_LAST_LOGGED_SUBSCRIPTION_KEY, newestCandidateTime)
+            .apply()
+        iapCache.edit()
+            .putLong(TIME_OF_LAST_LOGGED_PURCHASE_KEY, newestCandidateTime)
+            .apply()
+        deleteOldCacheHistory()
     }
-    sharedPreferences.edit().putStringSet(PURCHASE_DETAILS_SET, cachedPurchaseSet).apply()
-    return HashMap(purchaseDetailsMap)
-  }
 
-  @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
-  internal fun clearOutdatedProductInfoInCache() {
-    val nowSec = System.currentTimeMillis() / 1000L
-    val lastClearedTimeSec = sharedPreferences.getLong(LAST_CLEARED_TIME, 0)
-    if (lastClearedTimeSec == 0L) {
-      sharedPreferences.edit().putLong(LAST_CLEARED_TIME, nowSec).apply()
-    } else if (nowSec - lastClearedTimeSec > CACHE_CLEAR_TIME_LIMIT_SEC) {
-      val tempPurchaseMap: Map<String, Long> = cachedPurchaseMap.toMap()
-      for ((purchaseToken, historyPurchaseTime) in tempPurchaseMap) {
-        if (nowSec - historyPurchaseTime > PURCHASE_IN_CACHE_INTERVAL) {
-          cachedPurchaseSet.remove("$purchaseToken;$historyPurchaseTime")
-          cachedPurchaseMap.remove(purchaseToken)
-        }
-      }
-      sharedPreferences
-          .edit()
-          .putStringSet(PURCHASE_DETAILS_SET, cachedPurchaseSet)
-          .putLong(LAST_CLEARED_TIME, nowSec)
-          .apply()
+    @JvmStatic
+    fun deleteOldCacheHistory() {
+        // clear cached purchases logged by lib 1
+        val cachedSkuSharedPref =
+            getApplicationContext()
+                .getSharedPreferences(IAP_SKU_CACHE_GPBLV1, Context.MODE_PRIVATE)
+        val cachedPurchaseSharedPref =
+            getApplicationContext()
+                .getSharedPreferences(IAP_PURCHASE_CACHE_GPBLV1, Context.MODE_PRIVATE)
+        cachedSkuSharedPref.edit().clear().apply()
+        cachedPurchaseSharedPref.edit().clear().apply()
+
+        // clear cached purchases logged by lib 2 - 3
+        val sharedPreferences =
+            getApplicationContext().getSharedPreferences(
+                IAP_CACHE_OLD,
+                Context.MODE_PRIVATE
+            )
+        sharedPreferences.edit().clear().apply()
     }
-  }
 
-  @JvmStatic
-  fun eligibleQueryPurchaseHistory(): Boolean {
-    readPurchaseCache()
-    val nowSec = System.currentTimeMillis() / 1000L
-    val lastQueryPurchaseHistoryTime =
-        sharedPreferences.getLong(LAST_QUERY_PURCHASE_HISTORY_TIME, 0)
-    if (lastQueryPurchaseHistoryTime != 0L &&
-        nowSec - lastQueryPurchaseHistoryTime < PURCHASE_IN_CACHE_INTERVAL) {
-      return false
+    @JvmStatic
+    fun getIsFirstAppLaunchWithNewIAP(): Boolean {
+        val iapCache =
+            getApplicationContext().getSharedPreferences(
+                IAP_CACHE_GPBLV2V7,
+                Context.MODE_PRIVATE
+            )
+        return !iapCache.contains(APP_HAS_BEEN_LAUNCHED_KEY)
     }
-    sharedPreferences.edit().putLong(LAST_QUERY_PURCHASE_HISTORY_TIME, nowSec).apply()
-    return true
-  }
 
-  @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
-  internal fun constructLoggingReadyMap(
-      purchaseDetailsMap: Map<String, JSONObject>,
-      skuDetailsMap: Map<String, JSONObject?>
-  ): Map<String, String> {
-    val nowSec = System.currentTimeMillis() / 1000L
-    val purchaseResultMap: MutableMap<String, String> = mutableMapOf()
-    for ((key, purchaseDetail) in purchaseDetailsMap) {
-      val skuDetail = skuDetailsMap[key]
-      if (purchaseDetail != null && purchaseDetail.has(PURCHASE_TIME)) {
+    @JvmStatic
+    fun setAppHasBeenLaunchedWithNewIAP() {
+        val iapCache =
+            getApplicationContext().getSharedPreferences(
+                IAP_CACHE_GPBLV2V7,
+                Context.MODE_PRIVATE
+            )
         try {
-          val purchaseTime = purchaseDetail.getLong(PURCHASE_TIME)
-          // Purchase is too old (more than 24h) to log
-          if (nowSec - purchaseTime / 1000L > PURCHASE_IN_CACHE_INTERVAL) {
-            continue
-          }
-          if (skuDetail != null) {
-            purchaseResultMap[purchaseDetail.toString()] = skuDetail.toString()
-          }
+            iapCache.edit()
+                .putBoolean(APP_HAS_BEEN_LAUNCHED_KEY, true)
+                .apply()
         } catch (e: Exception) {
-          /* swallow */
+            /* Swallow */
         }
-      }
     }
-    return purchaseResultMap
-  }
+
+    @JvmStatic
+    fun updateLatestPossiblePurchaseTime() {
+        setAppHasBeenLaunchedWithNewIAP()
+        try {
+            val iapCache =
+                getApplicationContext().getSharedPreferences(
+                    IAP_CACHE_GPBLV2V7,
+                    Context.MODE_PRIVATE
+                )
+            val currTime = System.currentTimeMillis()
+            iapCache.edit()
+                .putLong(TIME_OF_LAST_LOGGED_SUBSCRIPTION_KEY, currTime)
+                .apply()
+            iapCache.edit()
+                .putLong(TIME_OF_LAST_LOGGED_PURCHASE_KEY, currTime)
+                .apply()
+        } catch (e: Exception) {
+            /* Swallow */
+        }
+    }
+
+    @JvmStatic
+    fun filterPurchaseLogging(
+        purchaseDetailsMap: MutableMap<String, JSONObject>,
+        skuDetailsMap: Map<String, JSONObject?>,
+        isSubscription: Boolean,
+        packageName: String,
+        billingClientVersion: InAppPurchaseUtils.BillingClientVersion,
+        isFirstAppLaunch: Boolean,
+    ) {
+        val deduped = cacheDeDupPurchase(purchaseDetailsMap, isSubscription)
+        val loggingReady = constructLoggingReadyMap(
+            deduped,
+            skuDetailsMap,
+            packageName
+        )
+        logPurchases(loggingReady, isSubscription, billingClientVersion, isFirstAppLaunch)
+    }
+
+    private fun logPurchases(
+        purchaseDetailsMap: Map<String, String>,
+        isSubscription: Boolean,
+        billingClientVersion: InAppPurchaseUtils.BillingClientVersion,
+        isFirstAppLaunch: Boolean
+    ) {
+        for ((purchaseDetails, skuDetails) in purchaseDetailsMap) {
+            logPurchase(
+                purchaseDetails,
+                skuDetails,
+                isSubscription,
+                billingClientVersion,
+                isFirstAppLaunch
+            )
+        }
+    }
+
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    internal fun cacheDeDupPurchase(
+        purchaseDetailsMap: MutableMap<String, JSONObject>,
+        isSubscription: Boolean,
+    ): Map<String, JSONObject> {
+        val iapCache =
+            getApplicationContext().getSharedPreferences(
+                IAP_CACHE_GPBLV2V7,
+                Context.MODE_PRIVATE
+            )
+        var timeOfLatestNewlyLoggedPurchase: Long = 0
+        val timeOfLastLoggedPurchase: Long =
+            if (isSubscription) {
+                iapCache.getLong(
+                    TIME_OF_LAST_LOGGED_SUBSCRIPTION_KEY,
+                    APPROXIMATE_IAP_ENHANCEMENT_RELEASE_TIME
+                )
+            } else {
+                iapCache.getLong(
+                    TIME_OF_LAST_LOGGED_PURCHASE_KEY,
+                    APPROXIMATE_IAP_ENHANCEMENT_RELEASE_TIME
+                )
+            }
+
+        val tempPurchaseDetailsMap: Map<String, JSONObject> = purchaseDetailsMap.toMap()
+        for ((key, purchaseJson) in tempPurchaseDetailsMap) {
+            try {
+                if (purchaseJson.has(Constants.GP_IAP_PURCHASE_TOKEN) && purchaseJson.has(
+                        Constants.GP_IAP_PURCHASE_TIME
+                    )
+                ) {
+                    val purchaseTime = purchaseJson.getLong(PURCHASE_TIME)
+                    if (purchaseTime <= timeOfLastLoggedPurchase) {
+                        purchaseDetailsMap.remove(key)
+                    }
+
+                    timeOfLatestNewlyLoggedPurchase =
+                        max(timeOfLatestNewlyLoggedPurchase, purchaseTime)
+                }
+            } catch (e: Exception) {
+                /* swallow */
+            }
+        }
+        if (timeOfLatestNewlyLoggedPurchase >= timeOfLastLoggedPurchase) {
+            if (isSubscription) {
+                iapCache.edit()
+                    .putLong(TIME_OF_LAST_LOGGED_SUBSCRIPTION_KEY, timeOfLatestNewlyLoggedPurchase)
+                    .apply()
+            } else {
+                iapCache.edit()
+                    .putLong(TIME_OF_LAST_LOGGED_PURCHASE_KEY, timeOfLatestNewlyLoggedPurchase)
+                    .apply()
+            }
+        }
+        return HashMap(purchaseDetailsMap)
+    }
+
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    internal fun constructLoggingReadyMap(
+        purchaseDetailsMap: Map<String, JSONObject>,
+        skuDetailsMap: Map<String, JSONObject?>,
+        packageName: String
+    ): Map<String, String> {
+        val purchaseResultMap: MutableMap<String, String> = mutableMapOf()
+        for ((key, purchaseDetail) in purchaseDetailsMap) {
+            val skuDetail = skuDetailsMap[key]
+            try {
+                // Used during server-side processing of purchase verification
+                purchaseDetail.put(InAppPurchaseConstants.PACKAGE_NAME, packageName)
+
+                if (skuDetail != null) {
+                    purchaseResultMap[purchaseDetail.toString()] = skuDetail.toString()
+                }
+            } catch (e: Exception) {
+                /* swallow */
+            }
+        }
+        return purchaseResultMap
+    }
 }
